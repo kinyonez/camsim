@@ -1,87 +1,76 @@
-import { BackSide, DirectionalLight, HemisphereLight, Mesh, type Scene, ShaderMaterial, SphereGeometry, Vector3 } from 'three';
-import type { City } from './city';
+import { BackSide, DirectionalLight, Mesh, type Scene, ShaderMaterial, SphereGeometry, Vector3 } from 'three';
+import { ambientUniforms } from './materials';
 import { Photometry } from './photometry';
-
-export type Weather = 'sunny' | 'overcast' | 'night';
-
-export const WEATHER_LABELS: Record<Weather, string> = {
-  sunny: '晴れた昼',
-  overcast: '曇りの昼',
-  night: '夜',
-};
+import type { NightSky, OutdoorConditions, Weather } from './situation';
 
 type RGB = [number, number, number];
 
-// 物理値の目安
+// 屋外の光 (直射光・天空・空の見た目) の物理値
 //   晴天: 太陽 直射 ~90,000 lx, 天空 ~15,000 lx, 青空の輝度 ~3,000〜8,000 cd/m², 太陽面 ~1.6e9 cd/m²
 //   曇天: 天空 ~6,000 lx (CIE 曇天空: 天頂は地平の約 3 倍の輝度)
-//   夜  : 街灯 ~1,500 cd (直下 8m で ~20 lx), 点灯した窓 ~50 cd/m², 夜空 ~0.003〜0.03 cd/m²
-interface WeatherSpec {
-  sunLux: number;
+//   夜  : 都市は光害で空がやや明るく月なし。郊外は月明かり ~0.2 lx (月面 ~2,500 cd/m²) と星
+interface OutdoorSpec {
+  directLux: number;
+  directDir: Vector3;
+  directColor: RGB;
   /** 半球光 [lx] (上向き面 / 下向き面が受ける照度) */
   skyLux: RGB;
   groundLux: RGB;
   zenith: RGB;
   horizon: RGB;
   sunDisk: number;
-  windowWarm: number;
-  windowCool: number;
-  lampHead: number;
-  lampCandela: number;
-  neon: number;
-  headlight: number;
-  taillight: number;
+  moonDisk: number;
+  stars: number;
 }
 
-const SPECS: Record<Weather, WeatherSpec> = {
-  sunny: {
-    sunLux: 90_000,
-    skyLux: [11_000, 14_000, 19_000],
-    groundLux: [9_000, 8_500, 7_500],
-    zenith: [1_800, 3_200, 6_500],
-    horizon: [6_500, 7_500, 9_000],
-    sunDisk: 1.6e9,
-    windowWarm: 0,
-    windowCool: 0,
-    lampHead: 0,
-    lampCandela: 0,
-    neon: 0,
-    headlight: 0,
-    taillight: 0,
-  },
-  overcast: {
-    sunLux: 0,
-    skyLux: [6_000, 6_300, 6_700],
-    groundLux: [1_300, 1_250, 1_150],
-    zenith: [3_000, 3_100, 3_300],
-    horizon: [1_000, 1_050, 1_100],
-    sunDisk: 0,
-    windowWarm: 0,
-    windowCool: 0,
-    lampHead: 0,
-    lampCandela: 0,
-    neon: 300,
-    headlight: 0,
-    taillight: 0,
-  },
-  night: {
-    sunLux: 0,
-    skyLux: [0.03, 0.035, 0.05],
-    groundLux: [0.25, 0.18, 0.12],
-    zenith: [0.002, 0.003, 0.006],
-    horizon: [0.04, 0.025, 0.015],
-    sunDisk: 0,
-    windowWarm: 60,
-    windowCool: 40,
-    lampHead: 40_000,
-    lampCandela: 1_500,
-    neon: 800,
-    headlight: 80_000,
-    taillight: 1_500,
-  },
-};
-
 const SUN_DIRECTION = new Vector3(-0.55, 0.62, -0.56).normalize();
+const MOON_DIRECTION = new Vector3(0.5, 0.45, -0.75).normalize();
+
+function outdoorSpec(w: Weather, night: NightSky): OutdoorSpec {
+  const none = { directLux: 0, directDir: SUN_DIRECTION, directColor: [1, 1, 1] as RGB, sunDisk: 0, moonDisk: 0, stars: 0 };
+  if (w === 'sunny') {
+    return {
+      ...none,
+      directLux: 90_000,
+      directColor: [1, 0.96, 0.91],
+      skyLux: [11_000, 14_000, 19_000],
+      groundLux: [9_000, 8_500, 7_500],
+      zenith: [1_800, 3_200, 6_500],
+      horizon: [6_500, 7_500, 9_000],
+      sunDisk: 1.6e9,
+    };
+  }
+  if (w === 'overcast') {
+    return {
+      ...none,
+      skyLux: [6_000, 6_300, 6_700],
+      groundLux: [1_300, 1_250, 1_150],
+      zenith: [3_000, 3_100, 3_300],
+      horizon: [1_000, 1_050, 1_100],
+    };
+  }
+  if (night === 'urban') {
+    return {
+      ...none,
+      skyLux: [0.03, 0.035, 0.05],
+      groundLux: [0.25, 0.18, 0.12],
+      zenith: [0.002, 0.003, 0.006],
+      horizon: [0.04, 0.025, 0.015],
+    };
+  }
+  return {
+    ...none,
+    directLux: 0.2,
+    directDir: MOON_DIRECTION,
+    directColor: [0.9, 0.95, 1.0],
+    skyLux: [0.006, 0.008, 0.014],
+    groundLux: [0.004, 0.004, 0.004],
+    zenith: [0.0008, 0.0012, 0.0025],
+    horizon: [0.002, 0.0025, 0.004],
+    moonDisk: 2_500,
+    stars: 1,
+  };
+}
 
 const skyVertex = /* glsl */ `
 varying vec3 vDir;
@@ -96,8 +85,18 @@ uniform vec3 uZenith;
 uniform vec3 uHorizon;
 uniform vec3 uSunDir;
 uniform float uSunDisk;
+uniform vec3 uMoonDir;
+uniform float uMoonDisk;
+uniform float uStars;
 uniform float uPreExposure;
 varying vec3 vDir;
+
+float hash13(vec3 p) {
+  p = fract(p * 0.1031);
+  p += dot(p, p.zyx + 31.32);
+  return fract((p.x + p.y) * p.z);
+}
+
 void main() {
   vec3 d = normalize(vDir);
   float h = max(d.y, 0.0);
@@ -105,40 +104,40 @@ void main() {
   // 地平線より下は地面の照り返し程度
   if (d.y < 0.0) L = uHorizon * 0.3;
   float cosSun = dot(d, uSunDir);
-  // 太陽周辺のグロー (晴天のみ)
+  // 太陽周辺のグロー
   L += uSunDisk * 4e-6 * pow(max(cosSun, 0.0), 200.0) * vec3(1.0, 0.95, 0.85);
-  // 太陽面 (視直径 0.53°)
+  // 太陽面・月面 (視直径 0.53°)
   if (cosSun > 0.99996) L += uSunDisk * vec3(1.0, 0.97, 0.92);
+  if (dot(d, uMoonDir) > 0.99996) L += uMoonDisk * vec3(0.95, 0.95, 1.0);
+  // 星: 方向をセルに分け、まれなセルの中心付近だけ光らせる (視直径 ~0.03°)
+  if (uStars > 0.0 && d.y > 0.02) {
+    vec3 cell = floor(d * 400.0);
+    float r = hash13(cell);
+    if (r > 0.985) {
+      vec3 center = (cell + 0.5 + (vec3(hash13(cell + 1.0), hash13(cell + 2.0), hash13(cell + 3.0)) - 0.5) * 0.6) / 400.0;
+      if (length(d - center) < 0.00025) L += uStars * pow(10.0, (r - 0.985) / 0.015 * 3.0) * vec3(0.9, 0.95, 1.0);
+    }
+  }
   // half float の上限に収める (どの露出でも白飛びする値)
   gl_FragColor = vec4(min(L * uPreExposure, vec3(60000.0)), 1.0);
 }`;
 
+/** 屋外の光 (太陽 or 月・天空光・空) を管理する。シチュエーション固有の光源は各 Situation が持つ */
 export class Environment {
   readonly photometry = new Photometry();
-  private sun: DirectionalLight;
-  private hemi: HemisphereLight;
+  private direct: DirectionalLight;
   private sky: ShaderMaterial;
+  private directDir = SUN_DIRECTION;
+  private shadowCenter = new Vector3();
+  private shadowExtent = 170;
 
-  constructor(
-    scene: Scene,
-    private city: City,
-  ) {
-    this.sun = new DirectionalLight(0xfff4e8, 1);
-    this.sun.position.copy(SUN_DIRECTION).multiplyScalar(300);
-    this.sun.castShadow = true;
-    this.sun.shadow.mapSize.set(4096, 4096);
-    const cam = this.sun.shadow.camera;
-    cam.left = cam.bottom = -170;
-    cam.right = cam.top = 170;
-    cam.near = 10;
-    cam.far = 700;
-    this.sun.shadow.bias = -0.0004;
-    this.sun.shadow.normalBias = 0.05;
-    scene.add(this.sun);
-
-    // 色に照度 [lx] を直接入れ、intensity には pre-exposure だけを掛ける
-    this.hemi = new HemisphereLight(0xffffff, 0xffffff, 1);
-    scene.add(this.hemi);
+  constructor(scene: Scene) {
+    this.direct = new DirectionalLight(0xffffff, 1);
+    this.direct.castShadow = true;
+    this.direct.shadow.mapSize.set(4096, 4096);
+    this.direct.shadow.bias = -0.0004;
+    this.direct.shadow.normalBias = 0.05;
+    scene.add(this.direct, this.direct.target);
 
     this.sky = new ShaderMaterial({
       vertexShader: skyVertex,
@@ -150,44 +149,63 @@ export class Environment {
         uHorizon: { value: new Vector3() },
         uSunDir: { value: SUN_DIRECTION.clone() },
         uSunDisk: { value: 0 },
+        uMoonDir: { value: MOON_DIRECTION.clone() },
+        uMoonDisk: { value: 0 },
+        uStars: { value: 0 },
         uPreExposure: { value: 1 },
       },
     });
-    const skyMesh = new Mesh(new SphereGeometry(2500, 32, 16), this.sky);
+    const skyMesh = new Mesh(new SphereGeometry(4000, 32, 16), this.sky);
     skyMesh.frustumCulled = false;
     skyMesh.renderOrder = -1;
     scene.add(skyMesh);
-
-    const m = city.materials;
-    const p = this.photometry;
-    p.addLight(this.sun, 0);
-    p.addLight(this.hemi, 1);
-    p.addSky(this.sky);
-    for (const mat of [m.windowWarm, m.windowCool, m.lampHead, m.neonPink, m.neonCyan, m.headlight, m.taillight]) p.addEmissive(mat, 0);
-    for (const l of city.lampLights) p.addLight(l, 0);
+    this.photometry.addSky(this.sky);
   }
 
-  setWeather(w: Weather): void {
-    const s = SPECS[w];
+  /** 影を計算する範囲 (平行投影の影カメラ) を設定 */
+  setShadowArea(center: Vector3, extent: number): void {
+    const cam = this.direct.shadow.camera;
+    cam.left = cam.bottom = -extent;
+    cam.right = cam.top = extent;
+    cam.near = 1;
+    cam.far = extent * 4;
+    cam.updateProjectionMatrix();
+    this.shadowCenter.copy(center);
+    this.shadowExtent = extent;
+    this.aimDirect();
+  }
+
+  setWeather(w: Weather, night: NightSky): OutdoorConditions {
+    const s = outdoorSpec(w, night);
     const p = this.photometry;
-    const m = this.city.materials;
-    this.sun.visible = s.sunLux > 0;
-    p.setBase(this.sun, s.sunLux);
-    this.hemi.color.setRGB(...s.skyLux);
-    this.hemi.groundColor.setRGB(...s.groundLux);
-    this.sky.uniforms.uZenith.value.set(...s.zenith);
-    this.sky.uniforms.uHorizon.value.set(...s.horizon);
-    this.sky.uniforms.uSunDisk.value = s.sunDisk;
-    p.setBase(m.windowWarm, s.windowWarm);
-    p.setBase(m.windowCool, s.windowCool);
-    p.setBase(m.lampHead, s.lampHead);
-    p.setBase(m.neonPink, s.neon);
-    p.setBase(m.neonCyan, s.neon);
-    p.setBase(m.headlight, s.headlight);
-    p.setBase(m.taillight, s.taillight);
-    for (const l of this.city.lampLights) {
-      l.visible = s.lampCandela > 0;
-      p.setBase(l, s.lampCandela);
-    }
+    this.direct.visible = s.directLux > 0;
+    this.direct.color.setRGB(...s.directColor);
+    this.directDir = s.directDir;
+    this.aimDirect();
+    p.setLight(this.direct, s.directLux);
+    p.setVector(ambientUniforms.exterior.up, s.skyLux);
+    p.setVector(ambientUniforms.exterior.down, s.groundLux);
+    const u = this.sky.uniforms;
+    u.uZenith.value.set(...s.zenith);
+    u.uHorizon.value.set(...s.horizon);
+    u.uSunDisk.value = s.sunDisk;
+    u.uMoonDisk.value = s.moonDisk;
+    u.uStars.value = s.stars;
+
+    const mean = (c: RGB) => (c[0] + c[1] + c[2]) / 3;
+    return {
+      weather: w,
+      directLux: s.directLux,
+      directDir: s.directDir.clone(),
+      // 水平に見える景色 ≈ 地平付近の空と、照らされた地面 (輝度 = 照度 / π) の半々
+      horizontalLuminance: 0.5 * mean(s.horizon) + (0.5 * mean(s.groundLux)) / Math.PI,
+    };
+  }
+
+  /** 直射光を影の範囲の中心に向ける */
+  private aimDirect(): void {
+    this.direct.position.copy(this.shadowCenter).addScaledVector(this.directDir, this.shadowExtent * 2);
+    this.direct.target.position.copy(this.shadowCenter);
+    this.direct.target.updateMatrixWorld();
   }
 }

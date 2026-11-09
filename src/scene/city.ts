@@ -1,18 +1,8 @@
-import {
-  BoxGeometry,
-  BufferGeometry,
-  Color,
-  ConeGeometry,
-  CylinderGeometry,
-  Float32BufferAttribute,
-  Group,
-  Mesh,
-  MeshLambertMaterial,
-  PlaneGeometry,
-  PointLight,
-  type Material,
-} from 'three';
-import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+import { BoxGeometry, Color, ConeGeometry, CylinderGeometry, Group, Mesh, type MeshLambertMaterial, PlaneGeometry, PointLight, Vector3 } from 'three';
+import { Batch, box, mulberry32 } from './geometry';
+import { exteriorMaterial } from './materials';
+import type { Photometry } from './photometry';
+import type { OutdoorConditions, Situation } from './situation';
 
 // 手続き生成のローポリ都市。1 unit = 1 m。
 // 道路は 50m 間隔の格子、街区は 38m 角。描画コールを減らすため、同じマテリアルの部品は頂点カラー付きで結合する。
@@ -24,42 +14,6 @@ const BLOCK = ROAD_SPACING - ROAD_WIDTH;
 const LAMP_HEIGHT = 8;
 /** 実光源 (PointLight) を置く街灯の範囲。forward レンダリングなので数を絞る */
 const LIT_LAMP_RANGE = 50;
-
-function mulberry32(seed: number): () => number {
-  return () => {
-    seed |= 0;
-    seed = (seed + 0x6d2b79f5) | 0;
-    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-
-/** 同じマテリアルで描く部品を頂点カラー付きでまとめる */
-class Batch {
-  private parts: BufferGeometry[] = [];
-
-  add(geo: BufferGeometry, color: Color | number): void {
-    const c = color instanceof Color ? color : new Color(color);
-    const n = geo.attributes.position.count;
-    const colors = new Float32Array(n * 3);
-    for (let i = 0; i < n; i++) colors.set([c.r, c.g, c.b], i * 3);
-    geo.setAttribute('color', new Float32BufferAttribute(colors, 3));
-    this.parts.push(geo);
-  }
-
-  build(material: Material, shadows = true): Mesh | null {
-    if (this.parts.length === 0) return null;
-    const mesh = new Mesh(mergeGeometries(this.parts), material);
-    mesh.castShadow = shadows;
-    mesh.receiveShadow = shadows;
-    return mesh;
-  }
-}
-
-function box(w: number, h: number, d: number, x: number, y: number, z: number): BufferGeometry {
-  return new BoxGeometry(w, h, d).translate(x, y, z);
-}
 
 export interface CityMaterials {
   /** 昼夜共通の拡散反射面 */
@@ -83,33 +37,36 @@ interface Car {
   phase: number;
 }
 
-export interface City {
-  root: Group;
-  materials: CityMaterials;
-  lampLights: PointLight[];
-  /** 絶対時刻 [s] での車の位置を設定する（露光中のモーションブラーに使う） */
-  update(timeSec: number): void;
-}
+// 夜の発光体・街灯の物理値: 街灯 ~1,500 cd (直下 8m で ~20 lx), 点灯した窓 ~50 cd/m², ネオン ~800 cd/m²
+const NIGHT = {
+  windowWarm: 60,
+  windowCool: 40,
+  lampHead: 40_000,
+  lampCandela: 1_500,
+  neon: 800,
+  headlight: 80_000,
+  taillight: 1_500,
+};
 
 const PALETTE = ['#b9a48c', '#9c8f84', '#c8bfae', '#8a9196', '#a7765f', '#d6cdb8', '#7f8a7a', '#b5876b', '#9aa3ab'].map(
   (c) => new Color(c),
 );
 const CAR_COLORS = ['#c0392b', '#2c3e50', '#ecf0f1', '#f1c40f', '#2980b9', '#7f8c8d', '#16a085'].map((c) => new Color(c));
 
-export function createCity(seed = 7): City {
+export function createCity(seed = 7): Situation {
   const rand = mulberry32(seed);
   const root = new Group();
 
   const materials: CityMaterials = {
-    surface: new MeshLambertMaterial({ vertexColors: true, flatShading: true }),
-    windowWarm: new MeshLambertMaterial({ color: 0x1a1f26, emissive: 0xffc98a }),
-    windowCool: new MeshLambertMaterial({ color: 0x1a1f26, emissive: 0xdde8ff }),
-    windowDark: new MeshLambertMaterial({ color: 0x1a1f26 }),
-    lampHead: new MeshLambertMaterial({ color: 0xdddddd, emissive: 0xffd9a0 }),
-    neonPink: new MeshLambertMaterial({ color: 0x553344, emissive: 0xff3399 }),
-    neonCyan: new MeshLambertMaterial({ color: 0x335555, emissive: 0x33e0ff }),
-    headlight: new MeshLambertMaterial({ color: 0xdddddd, emissive: 0xfff4e0 }),
-    taillight: new MeshLambertMaterial({ color: 0x661111, emissive: 0xff1a0a }),
+    surface: exteriorMaterial({ vertexColors: true }),
+    windowWarm: exteriorMaterial({ color: 0x1a1f26, emissive: 0xffc98a }),
+    windowCool: exteriorMaterial({ color: 0x1a1f26, emissive: 0xdde8ff }),
+    windowDark: exteriorMaterial({ color: 0x1a1f26 }),
+    lampHead: exteriorMaterial({ color: 0xdddddd, emissive: 0xffd9a0 }),
+    neonPink: exteriorMaterial({ color: 0x553344, emissive: 0xff3399 }),
+    neonCyan: exteriorMaterial({ color: 0x335555, emissive: 0x33e0ff }),
+    headlight: exteriorMaterial({ color: 0xdddddd, emissive: 0xfff4e0 }),
+    taillight: exteriorMaterial({ color: 0x661111, emissive: 0xff1a0a }),
   };
 
   const surface = new Batch();
@@ -271,7 +228,33 @@ export function createCity(seed = 7): City {
   }
   update(0);
 
-  return { root, materials, lampLights, update };
+  function setWeather(c: OutdoorConditions, p: Photometry): void {
+    const night = c.weather === 'night';
+    const m = materials;
+    p.setEmissive(m.windowWarm, night ? NIGHT.windowWarm : 0);
+    p.setEmissive(m.windowCool, night ? NIGHT.windowCool : 0);
+    p.setEmissive(m.lampHead, night ? NIGHT.lampHead : 0);
+    // ネオンは曇りの昼も点灯
+    const neon = c.weather === 'sunny' ? 0 : night ? NIGHT.neon : NIGHT.neon * 0.4;
+    p.setEmissive(m.neonPink, neon);
+    p.setEmissive(m.neonCyan, neon);
+    p.setEmissive(m.headlight, night ? NIGHT.headlight : 0);
+    p.setEmissive(m.taillight, night ? NIGHT.taillight : 0);
+    for (const l of lampLights) {
+      l.visible = night;
+      p.setLight(l, night ? NIGHT.lampCandela : 0);
+    }
+  }
+
+  return {
+    root,
+    bounds: { min: new Vector3(-CITY_HALF, 0.3, -CITY_HALF), max: new Vector3(CITY_HALF, 150, CITY_HALF) },
+    start: { position: new Vector3(3, 1.6, 40), yaw: 0, pitch: 0, focus: 12, focal: 35 },
+    shadow: { center: new Vector3(0, 0, 0), extent: 170 },
+    nightSky: 'urban',
+    setWeather,
+    update,
+  };
 }
 
 function addTree(batch: Batch, x: number, z: number, rand: () => number): void {
@@ -282,8 +265,8 @@ function addTree(batch: Batch, x: number, z: number, rand: () => number): void {
 
 function createCar(m: CityMaterials, color: Color): Group {
   const g = new Group();
-  const body = new Mesh(new BoxGeometry(4.3, 0.8, 1.8).translate(0, 0.65, 0), new MeshLambertMaterial({ color, flatShading: true }));
-  const cabin = new Mesh(new BoxGeometry(2.2, 0.6, 1.6).translate(-0.3, 1.35, 0), new MeshLambertMaterial({ color: 0x2a3138, flatShading: true }));
+  const body = new Mesh(new BoxGeometry(4.3, 0.8, 1.8).translate(0, 0.65, 0), exteriorMaterial({ color }));
+  const cabin = new Mesh(new BoxGeometry(2.2, 0.6, 1.6).translate(-0.3, 1.35, 0), exteriorMaterial({ color: 0x2a3138 }));
   for (const mesh of [body, cabin]) {
     mesh.castShadow = true;
     mesh.receiveShadow = true;

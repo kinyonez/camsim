@@ -1,4 +1,5 @@
 import { Euler, MathUtils, type PerspectiveCamera, Vector2, Vector3 } from 'three';
+import type { CameraBounds } from './scene/situation';
 
 // 一人称のカメラ移動。ドラッグで向き、WASD で水平移動、E/Q で上下、ホイールで前後、クリックで AF。
 export class WalkControls {
@@ -17,7 +18,7 @@ export class WalkControls {
   constructor(
     private camera: PerspectiveCamera,
     dom: HTMLElement,
-    private bounds: { half: number; minY: number; maxY: number },
+    public bounds: CameraBounds,
   ) {
     dom.addEventListener('pointerdown', (e) => {
       this.dragging = true;
@@ -80,6 +81,14 @@ export class WalkControls {
     this.move(v.normalize().multiplyScalar(this.speed * boost * dt));
   }
 
+  /** 移動範囲と地面の高さに収める */
+  clampPosition(): void {
+    const { min, max, ground } = this.bounds;
+    const p = this.camera.position;
+    p.clamp(min, max);
+    if (ground) p.y = Math.max(p.y, ground(p.x, p.z) + 0.3);
+  }
+
   /** カメラの水平向き基準で移動 (y は鉛直) */
   private move(local: Vector3): void {
     const forward = new Vector3(Math.sin(this.yaw), 0, -Math.cos(this.yaw));
@@ -87,8 +96,7 @@ export class WalkControls {
     const p = this.camera.position;
     p.addScaledVector(right, local.x).addScaledVector(forward, -local.z);
     p.y += local.y;
-    const { half, minY, maxY } = this.bounds;
-    p.set(MathUtils.clamp(p.x, -half, half), MathUtils.clamp(p.y, minY, maxY), MathUtils.clamp(p.z, -half, half));
+    this.clampPosition();
     this.onChange?.();
   }
 }

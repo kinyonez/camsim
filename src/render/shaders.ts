@@ -26,13 +26,15 @@ varying vec2 vUv;
 
 const float GOLDEN_ANGLE = 2.39996323;
 const int MAX_ITER = 512;
+const float HALF_MAX = 65000.0;
 
 float distanceAt(vec2 uv) {
   return -perspectiveDepthToViewZ(texture2D(tDepth, uv).x, uNear, uFar);
 }
 
 void main() {
-  vec3 center = texture2D(tColor, vUv).rgb;
+  // half float の範囲外 (Inf) は 0 倍すると NaN になるので上限で抑える
+  vec3 center = min(texture2D(tColor, vUv).rgb, vec3(HALF_MAX));
   float d0 = distanceAt(vUv);
   float size0 = min(abs(uCocScale * (uInvFocus - 1.0 / d0)), uMaxRadius);
   if (uMaxRadius < 0.5) { gl_FragColor = vec4(center, 1.0); return; }
@@ -46,7 +48,7 @@ void main() {
   for (int i = 0; i < MAX_ITER; i++) {
     if (radius >= uMaxRadius) break;
     vec2 tc = vUv + vec2(cos(ang), sin(ang)) * uTexel * radius;
-    vec3 c = texture2D(tColor, tc).rgb;
+    vec3 c = min(texture2D(tColor, tc).rgb, vec3(HALF_MAX));
     float d = distanceAt(tc);
     float size = min(abs(uCocScale * (uInvFocus - 1.0 / d)), uMaxRadius);
     // 中心より奥にあるサンプルは、手前のシャープな物体に滲み出さない

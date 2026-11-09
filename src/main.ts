@@ -28,10 +28,14 @@ import { F_STOPS, ISO_STOPS, SHUTTER_STOPS, formatShutter, nearestShutter } from
 import { WalkControls } from './controls';
 import { applyLensSample, lensSample } from './render/lensSampler';
 import { CameraPipeline, METER_HEIGHT, METER_WIDTH } from './render/pipeline';
-import { CITY_HALF, createCity } from './scene/city';
-import { Environment, WEATHER_LABELS, type Weather } from './scene/environment';
+import { createCity } from './scene/city';
+import { Environment } from './scene/environment';
+import { createLandscape } from './scene/landscape';
+import { createRoom } from './scene/room';
+import { SITUATION_LABELS, type Situation, type SituationKind, WEATHER_LABELS, type Weather } from './scene/situation';
 
 const params = {
+  situation: 'city' as SituationKind,
   weather: 'sunny' as Weather,
   carsMoving: true,
   format: 'FF' as SensorFormat,
@@ -62,16 +66,52 @@ renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = PCFShadowMap;
 
 const scene = new Scene();
-const city = createCity();
-scene.add(city.root);
-const env = new Environment(scene, city);
-env.setWeather(params.weather);
-
-const camera = new PerspectiveCamera(50, 1.5, 0.1, 3000);
-camera.position.set(3, 1.6, 40);
-const controls = new WalkControls(camera, canvas, { half: CITY_HALF, minY: 0.3, maxY: 150 });
-controls.apply();
+const env = new Environment(scene);
+const camera = new PerspectiveCamera(50, 1.5, 0.1, 8000);
 const pipeline = new CameraPipeline(renderer);
+
+// シチュエーションは初回選択時に生成してキャッシュする
+const factories: Record<SituationKind, () => Situation> = { city: createCity, landscape: createLandscape, room: createRoom };
+const situations = new Map<SituationKind, Situation>();
+let situation = getSituation(params.situation);
+scene.add(situation.root);
+const controls = new WalkControls(camera, canvas, situation.bounds);
+
+function getSituation(kind: SituationKind): Situation {
+  let s = situations.get(kind);
+  if (!s) {
+    s = factories[kind]();
+    situations.set(kind, s);
+  }
+  return s;
+}
+
+/** 天気をシーン全体 (屋外の光 + シチュエーション固有の光源) に反映 */
+function applyWeather(): void {
+  const conditions = env.setWeather(params.weather, situation.nightSky);
+  situation.setWeather(conditions, env.photometry);
+  aeIterations = 3;
+}
+
+function switchSituation(kind: SituationKind): void {
+  scene.remove(situation.root);
+  situation = getSituation(kind);
+  scene.add(situation.root);
+  env.setShadowArea(situation.shadow.center, situation.shadow.extent);
+  controls.bounds = situation.bounds;
+  const st = situation.start;
+  camera.position.copy(st.position);
+  controls.yaw = st.yaw;
+  controls.pitch = st.pitch;
+  params.focus = st.focus;
+  params.focal = st.focal;
+  afPoint = null;
+  afMarker.classList.remove('tracking');
+  applyWeather();
+  controls.apply();
+  guiControllers.forEach((c) => c.updateDisplay());
+  invalidate();
+}
 
 // ---------- 状態 ----------
 type Mode = 'preview' | 'capturing' | 'captured';
@@ -178,7 +218,7 @@ function captureSamples(budgetMs: number): void {
     : { fullWidth: buf.x, fullHeight: buf.y, offsetX: 0, offsetY: 0, width: buf.x, height: buf.y };
   while (pipeline.accumulatedSamples < total && performance.now() - t0 < budgetMs) {
     const s = lensSample(pipeline.accumulatedSamples, total, apertureM, params.blades);
-    city.update(capture.time + s.time * shutter);
+    situation.update(capture.time + s.time * shutter);
     const shake = params.handheld ? HANDHELD_RAD_PER_SEC * shutter * (s.time - 0.5) : 0;
     applyLensSample(camera, capture.position, capture.quaternion, params.focus, view, s, params.handheld ? capture.shakeAxis : null, shake);
     pipeline.accumulate(scene, camera);
@@ -239,6 +279,7 @@ function updateMeter(px: Float32Array): void {
 
 /** 露出計が 0 になるようシャッター速度を合わせる */
 function autoExposure(): void {
+  if (!Number.isFinite(meterEV)) return;
   const target = shutterSeconds() * 2 ** -meterEV;
   params.shutter = nearestShutter(Math.min(30, target)).label;
   guiControllers.forEach((c) => c.updateDisplay());
@@ -289,9 +330,10 @@ const options = <K extends string>(rec: Record<K, { label: string }>) =>
   Object.fromEntries(Object.entries<{ label: string }>(rec).map(([k, v]) => [v.label, k]));
 
 const fScene = gui.addFolder('シーン');
-add(fScene.add(params, 'weather', Object.fromEntries(Object.entries(WEATHER_LABELS).map(([k, v]) => [v, k]))).name('天気'), () => {
-  env.setWeather(params.weather);
-  aeIterations = 3;
+const labelOptions = (rec: Record<string, string>) => Object.fromEntries(Object.entries(rec).map(([k, v]) => [v, k]));
+add(fScene.add(params, 'situation', labelOptions(SITUATION_LABELS)).name('シチュエーション'), () => switchSituation(params.situation));
+add(fScene.add(params, 'weather', labelOptions(WEATHER_LABELS)).name('天気'), () => {
+  applyWeather();
   invalidate();
 });
 add(fScene.add(params, 'carsMoving').name('車を動かす'));
@@ -353,7 +395,7 @@ let afHideTimer = 0;
 /** 画面上の点 (NDC) にある物体までの距離 (光軸方向) [m]。何もなければ ∞ */
 function measureFocus(ndc: Vector2): number {
   raycaster.setFromCamera(ndc, camera);
-  const hit = raycaster.intersectObject(city.root, true)[0];
+  const hit = raycaster.intersectObject(situation.root, true)[0];
   if (!hit) return FOCUS_INFINITY;
   const forward = new Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
   return Math.min(FOCUS_INFINITY, Math.max(FOCUS_MIN, +hit.point.clone().sub(camera.position).dot(forward).toFixed(2)));
@@ -382,6 +424,7 @@ controls.onClick = autofocus;
 // ---------- ループ ----------
 window.addEventListener('resize', layout);
 layout();
+switchSituation(params.situation);
 
 let last = performance.now();
 function tick(now: number): void {
@@ -396,7 +439,7 @@ function tick(now: number): void {
   let raw;
   if (mode === 'preview') {
     if (params.carsMoving) simTime += dt;
-    city.update(simTime);
+    situation.update(simTime);
     if (params.afMode === 'AF-C' && afPoint && frame % 3 === 0) {
       const d = measureFocus(afPoint);
       if (Math.abs(Math.log(d / params.focus)) > 0.002) {
@@ -432,4 +475,4 @@ function tick(now: number): void {
 requestAnimationFrame(tick);
 
 // デバッグ・自動テスト用
-Object.assign(window, { camsim: { params, startCapture, autoExposure, get mode() { return mode; }, invalidate, env, camera, controls, city } });
+Object.assign(window, { camsim: { params, startCapture, autoExposure, get mode() { return mode; }, get meterEV() { return meterEV; }, invalidate, env, camera, controls, switchSituation, applyWeather, get situation() { return situation; } } });
