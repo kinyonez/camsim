@@ -101,12 +101,21 @@ export function noiseParams(cfg: SensorConfig, iso: number): NoiseParams {
   return { electronsAtWhite, fullWell: d.fullWell, readNoise, electronsPerDN };
 }
 
+/** ノイズフロア [e⁻] = 読み出しノイズと量子化ノイズの合成 */
+export function noiseFloorElectrons(p: NoiseParams): number {
+  return Math.hypot(p.readNoise, p.electronsPerDN / Math.sqrt(12));
+}
+
 /** 工学的ダイナミックレンジ [stop] = log2(飽和電子数 / ノイズフロア) */
 export function dynamicRangeStops(cfg: SensorConfig, iso: number): number {
   const p = noiseParams(cfg, iso);
-  const quantNoise = p.electronsPerDN / Math.sqrt(12);
-  const floor = Math.hypot(p.readNoise, quantNoise);
-  return Math.log2(Math.min(p.fullWell, p.electronsAtWhite) / floor);
+  return Math.log2(Math.min(p.fullWell, p.electronsAtWhite) / noiseFloorElectrons(p));
+}
+
+/** 黒点 (RAW 値)。ノイズフロアに埋もれる = DR の下限より暗い部分は黒つぶれにする */
+export function blackPointRaw(cfg: SensorConfig, iso: number): number {
+  const p = noiseParams(cfg, iso);
+  return noiseFloorElectrons(p) / p.electronsAtWhite;
 }
 
 /** 拡散反射面 (反射率 albedo) の照度 E [lx] 下での輝度 [cd/m²] */

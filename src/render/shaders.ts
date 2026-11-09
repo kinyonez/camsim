@@ -77,6 +77,7 @@ void main() {
  *   光電子数 e = raw · eWhite
  *   ノイズ σ² = e (ショット) + σ_read² + LSB²/12 (量子化)
  *   飽和: 画素はフルウェル、ADC は RAW 1.0
+ *   現像: ノイズフロア以下は黒つぶれ、飽和は白飛び
  * uAveraging: 1 表示画素に含まれるセンサー画素数。縮小表示ではノイズが 1/√k に平均化される。
  */
 export const sensorFragment = /* glsl */ `
@@ -90,6 +91,7 @@ uniform bool uNoise;
 uniform uint uSeed;
 uniform float uPushEV;
 uniform bool uZebra;
+uniform float uBlackPoint;
 varying vec2 vUv;
 
 uvec3 pcg3d(uvec3 v) {
@@ -121,13 +123,20 @@ void main() {
     e = min(e, vec3(uFullWell));
   }
   vec3 r = min(e / uElectronsAtWhite, 1.0);
-  vec3 developed = clamp(r * exp2(uPushEV), 0.0, 1.0);
+  // 黒つぶれ: ノイズフロア (= DR の下限) を黒点にし、輝度がそれ以下なら黒に落とす
+  // (チャンネル別に引くと境界が赤や緑に色づくので、輝度で判定して色相は保つ)
+  float y = dot(r, vec3(0.2126, 0.7152, 0.0722));
+  float yCrushed = max(y - uBlackPoint, 0.0) / (1.0 - uBlackPoint);
+  vec3 developed = r * (yCrushed / max(y, 1e-6)) * exp2(uPushEV);
+  // 白飛び: どれかのチャンネルが飽和したら白へ寄せる (チャンネル別の飽和による色かぶりを防ぐ)
+  float peak = max(max(developed.r, developed.g), developed.b);
+  developed = mix(min(developed, 1.0), vec3(1.0), smoothstep(0.9, 1.0, peak));
   vec3 color = linearToSRGB(developed);
   if (uZebra) {
-    // 白飛び (いずれかのチャンネルが RAW 上限) をゼブラで警告
-    bool clipped = max(max(r.r, r.g), r.b) >= 0.999;
+    // 白飛び (いずれかのチャンネルが RAW 上限) と黒つぶれ (輝度が黒点以下) をゼブラで警告
     float stripe = step(0.5, fract((gl_FragCoord.x + gl_FragCoord.y) / 12.0));
-    if (clipped) color = mix(color, vec3(1.0, 0.0, 0.4), stripe * 0.8);
+    if (max(max(r.r, r.g), r.b) >= 0.999) color = mix(color, vec3(1.0, 0.0, 0.4), stripe * 0.8);
+    else if (y <= uBlackPoint) color = mix(color, vec3(0.1, 0.4, 1.0), stripe * 0.8);
   }
   gl_FragColor = vec4(color, 1.0);
 }`;

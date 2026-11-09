@@ -21,6 +21,7 @@ import {
   deriveSensor,
   dynamicRangeStops,
   noiseParams,
+  blackPointRaw,
   rawPerLuminance,
 } from './camera/sensor';
 import { F_STOPS, ISO_STOPS, SHUTTER_STOPS, formatShutter, nearestShutter } from './camera/stops';
@@ -41,13 +42,14 @@ const params = {
   shutter: '1/800',
   iso: 100,
   focus: 12,
+  afMode: 'AF-S' as 'AF-S' | 'AF-C',
   blades: 0,
   samples: 128,
   handheld: false,
   pixelPeep: false,
   noise: true,
   pushEV: 0,
-  zebra: true,
+  zebra: false,
 };
 
 // ---------- three.js ----------
@@ -78,8 +80,13 @@ let simTime = 0;
 let frame = 0;
 let meterEV = 0;
 let clippedRatio = 0;
+let crushedRatio = 0;
 let aeIterations = 3;
 const capture = { position: new Vector3(), quaternion: new Quaternion(), time: 0, seed: 1, shakeAxis: new Vector3() };
+
+/** これ以上はピント位置 ∞ として扱う [m] (400mm F1.2 の過焦点距離より遠い) */
+const FOCUS_INFINITY = 10_000;
+const FOCUS_MIN = 0.3;
 
 const sensorConfig = (): SensorConfig => ({ format: params.format, megapixels: params.megapixels, tech: params.tech });
 const shutterSeconds = (): number => SHUTTER_STOPS.find((s) => s.label === params.shutter)!.seconds;
@@ -192,6 +199,8 @@ function updateMeter(px: Float32Array): void {
   let sum = 0;
   let wSum = 0;
   let clipped = 0;
+  let crushed = 0;
+  const blackPoint = blackPointRaw(sensorConfig(), params.iso);
   const push = 2 ** params.pushEV;
   for (let y = 0; y < METER_HEIGHT; y++) {
     for (let x = 0; x < METER_WIDTH; x++) {
@@ -205,6 +214,7 @@ function updateMeter(px: Float32Array): void {
       sum += w * Math.min(lum, 2);
       wSum += w;
       if (Math.max(r, g, b) >= 1) clipped++;
+      else if (lum <= blackPoint) crushed++;
       const v = srgb(Math.min(1, Math.max(0, lum * push)));
       bins[Math.min(63, Math.floor(v * 64))]++;
     }
@@ -212,6 +222,7 @@ function updateMeter(px: Float32Array): void {
   // 18% グレーを基準にした露出計の値
   meterEV = Math.log2(Math.max(sum / wSum, 1e-6) / 0.18);
   clippedRatio = clipped / (METER_WIDTH * METER_HEIGHT);
+  crushedRatio = crushed / (METER_WIDTH * METER_HEIGHT);
 
   const { width, height } = histCanvas;
   histCtx.clearRect(0, 0, width, height);
@@ -246,8 +257,9 @@ function updateInfo(): void {
   const ev100 = Math.log2((params.fNumber * params.fNumber) / t) - Math.log2(params.iso / 100);
   const coc = acceptableCoCMm(s.widthMm, s.heightMm);
   const [near, far] = depthOfFieldMm(params.focal, params.fNumber, params.focus * 1000, coc);
-  const fmt = (mm: number) => (Number.isFinite(mm) ? `${(mm / 1000).toFixed(2)}m` : '∞');
+  const fmt = (mm: number) => (Number.isFinite(mm) && mm < FOCUS_INFINITY * 1000 ? `${(mm / 1000).toFixed(2)}m` : '∞');
   const items = [
+    `ピント ${fmt(params.focus * 1000)} (${params.afMode})`,
     `35mm換算 ${(params.focal * s.cropFactor).toFixed(0)}mm (水平 ${horizontalFovDeg(params.focal, s.widthMm).toFixed(1)}°)`,
     `${s.widthPx}×${s.heightPx}px / 画素ピッチ ${s.pitchUm.toFixed(2)}µm`,
     `飽和 ${Math.round(Math.min(n.fullWell, n.electronsAtWhite)).toLocaleString()}e⁻ / 読出しノイズ ${n.readNoise.toFixed(1)}e⁻ / DR ${dynamicRangeStops(cfg, params.iso).toFixed(1)}EV`,
@@ -257,7 +269,9 @@ function updateInfo(): void {
   ];
   infoEl.innerHTML = items.map((i) => `<span>${i}</span>`).join('');
 
-  const clip = clippedRatio > 0.001 ? ` / 白飛び ${(clippedRatio * 100).toFixed(1)}%` : '';
+  const clip =
+    (clippedRatio > 0.001 ? ` / 白飛び ${(clippedRatio * 100).toFixed(1)}%` : '') +
+    (crushedRatio > 0.001 ? ` / 黒つぶれ ${(crushedRatio * 100).toFixed(1)}%` : '');
   if (mode === 'preview') statusEl.textContent = `ライブビュー (ボケは近似)${clip}`;
   else if (mode === 'capturing') statusEl.textContent = `撮影中 ${pipeline.accumulatedSamples}/${params.samples}`;
   else statusEl.textContent = `撮影結果 ${params.samples} サンプル / ${formatShutter(t)} F${params.fNumber} ISO${params.iso}${clip}`;
@@ -292,7 +306,26 @@ add(fLens.add(params, 'focal', 8, 400, 1).name('焦点距離 [mm]'));
 add(fLens.add(params, 'fNumber', F_STOPS).name('F値'));
 add(fLens.add(params, 'shutter', SHUTTER_STOPS.map((s) => s.label)).name('シャッター'));
 add(fLens.add(params, 'iso', ISO_STOPS).name('ISO'));
-add(fLens.add(params, 'focus').min(0.3).max(2000).step(0.01).name('ピント距離 [m] (クリックでAF)'));
+add(fLens.add(params, 'afMode', { 'AF-S (クリック時に合わせる)': 'AF-S', 'AF-C (AF枠の位置で合わせ続ける)': 'AF-C' }).name('AF モード'), () => {
+  if (params.afMode === 'AF-C') autofocus(afPoint ?? new Vector2(0, 0));
+  else afMarker.classList.remove('tracking');
+});
+// MF: 0.3m〜∞ を対数スライダーで
+const manualFocus = {
+  get t(): number {
+    return Math.log(params.focus / FOCUS_MIN) / Math.log(FOCUS_INFINITY / FOCUS_MIN);
+  },
+  set t(v: number) {
+    params.focus = +(FOCUS_MIN * (FOCUS_INFINITY / FOCUS_MIN) ** v).toPrecision(3);
+    if (params.afMode === 'AF-C') params.afMode = 'AF-S';
+  },
+};
+add(fLens.add(manualFocus, 't', 0, 1, 0.001).name('MF (近 ⇔ ∞)'), () => {
+  afMarker.classList.remove('tracking');
+  guiControllers.forEach((c) => c.updateDisplay());
+  invalidate();
+});
+add(fLens.add(params, 'focus').min(FOCUS_MIN).max(FOCUS_INFINITY).step(0.01).name('ピント距離 [m]'));
 add(fLens.add(params, 'blades', { 円形: 0, '5枚': 5, '6枚': 6, '7枚': 7, '9枚': 9 }).name('絞り羽根 (撮影時)'));
 fLens.add({ ae: autoExposure }, 'ae').name('露出計に合わせてシャッター調整');
 
@@ -305,7 +338,7 @@ const fView = gui.addFolder('表示・現像');
 add(fView.add(params, 'pixelPeep').name('等倍表示 (中央)'));
 add(fView.add(params, 'noise').name('センサーノイズ'), () => {});
 add(fView.add(params, 'pushEV', -3, 6, 0.1).name('RAW 露出補正 [EV]'), () => {});
-add(fView.add(params, 'zebra').name('白飛び警告'), () => {});
+add(fView.add(params, 'zebra').name('白飛び・黒つぶれ警告 (ゼブラ)'), () => {});
 
 window.addEventListener('keydown', (e) => {
   if (e.code === 'Enter' && (e.target as HTMLElement).tagName !== 'INPUT') startCapture();
@@ -313,17 +346,38 @@ window.addEventListener('keydown', (e) => {
 
 // ---------- AF ----------
 const raycaster = new Raycaster();
-controls.onChange = invalidate;
-controls.onClick = (ndc) => {
-  updateCamera();
+const afMarker = document.querySelector<HTMLElement>('#afpoint')!;
+let afPoint: Vector2 | null = null;
+let afHideTimer = 0;
+
+/** 画面上の点 (NDC) にある物体までの距離 (光軸方向) [m]。何もなければ ∞ */
+function measureFocus(ndc: Vector2): number {
   raycaster.setFromCamera(ndc, camera);
   const hit = raycaster.intersectObject(city.root, true)[0];
-  if (!hit) return;
+  if (!hit) return FOCUS_INFINITY;
   const forward = new Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
-  params.focus = Math.max(0.3, +hit.point.clone().sub(camera.position).dot(forward).toFixed(2));
+  return Math.min(FOCUS_INFINITY, Math.max(FOCUS_MIN, +hit.point.clone().sub(camera.position).dot(forward).toFixed(2)));
+}
+
+function autofocus(ndc: Vector2): void {
+  afPoint = ndc.clone();
+  updateCamera();
+  params.focus = measureFocus(ndc);
   guiControllers.forEach((c) => c.updateDisplay());
   invalidate();
-};
+  // AF 枠: AF-S は合焦表示を少し出して消す、AF-C は出し続ける
+  afMarker.style.left = `${((ndc.x + 1) / 2) * 100}%`;
+  afMarker.style.top = `${((1 - ndc.y) / 2) * 100}%`;
+  afMarker.classList.remove('locked');
+  void afMarker.offsetWidth; // アニメーションを再生し直す
+  afMarker.classList.add('locked');
+  afMarker.classList.toggle('tracking', params.afMode === 'AF-C');
+  clearTimeout(afHideTimer);
+  afHideTimer = window.setTimeout(() => afMarker.classList.remove('locked'), 1200);
+}
+
+controls.onChange = invalidate;
+controls.onClick = autofocus;
 
 // ---------- ループ ----------
 window.addEventListener('resize', layout);
@@ -343,6 +397,13 @@ function tick(now: number): void {
   if (mode === 'preview') {
     if (params.carsMoving) simTime += dt;
     city.update(simTime);
+    if (params.afMode === 'AF-C' && afPoint && frame % 3 === 0) {
+      const d = measureFocus(afPoint);
+      if (Math.abs(Math.log(d / params.focus)) > 0.002) {
+        params.focus = d;
+        guiControllers.forEach((c) => c.updateDisplay());
+      }
+    }
     raw = pipeline.renderPreview(scene, camera, { cocScale, focusM: params.focus });
     if (frame % 8 === 0 || aeIterations > 0) {
       updateMeter(pipeline.readMeter(raw));
@@ -362,6 +423,7 @@ function tick(now: number): void {
     averaging,
     pushEV: params.pushEV,
     zebra: params.zebra,
+    blackPoint: blackPointRaw(sensorConfig(), params.iso),
     seed: mode === 'preview' ? frame : capture.seed,
   });
   if (frame % 6 === 0) updateInfo();
@@ -370,4 +432,4 @@ function tick(now: number): void {
 requestAnimationFrame(tick);
 
 // デバッグ・自動テスト用
-Object.assign(window, { camsim: { params, startCapture, autoExposure, get mode() { return mode; }, invalidate, env, camera, controls } });
+Object.assign(window, { camsim: { params, startCapture, autoExposure, get mode() { return mode; }, invalidate, env, camera, controls, city } });

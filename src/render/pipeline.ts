@@ -32,6 +32,8 @@ export interface DevelopParams {
   averaging: number;
   pushEV: number;
   zebra: boolean;
+  /** 黒点 (RAW 値)。これ以下は黒つぶれ */
+  blackPoint: number;
   seed: number;
 }
 
@@ -86,6 +88,7 @@ export class CameraPipeline {
       uSeed: { value: 0 },
       uPushEV: { value: 0 },
       uZebra: { value: false },
+      uBlackPoint: { value: 0 },
     });
     this.meterMat = material(meterFragment, { tRaw: { value: null } });
   }
@@ -152,6 +155,7 @@ export class CameraPipeline {
     u.uSeed.value = p.seed >>> 0;
     u.uPushEV.value = p.pushEV;
     u.uZebra.value = p.zebra;
+    u.uBlackPoint.value = p.blackPoint;
     this.pass(this.sensorMat, null);
   }
 
